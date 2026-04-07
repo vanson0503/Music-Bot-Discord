@@ -63,12 +63,19 @@ class Music(commands.Cog):
         vc = ctx.guild.voice_client
         if vc:
             if vc.channel != ctx.author.voice.channel:
-                await vc.move_to(ctx.author.voice.channel)
+                try:
+                    await vc.move_to(ctx.author.voice.channel)
+                except asyncio.TimeoutError:
+                    await ctx.send(embed=err_embed("Lỗi Timeout: Không thể di chuyển tới voice channel!"))
+                    return False
         else:
             try:
-                await ctx.author.voice.channel.connect()
+                await ctx.author.voice.channel.connect(timeout=15.0)
             except discord.ClientException:
                 await ctx.send(embed=err_embed("Không thể kết nối tới voice channel!"))
+                return False
+            except asyncio.TimeoutError:
+                await ctx.send(embed=err_embed("Lỗi Timeout: Hết thời gian chờ kết nối tới voice channel. Vui lòng thử lại!"))
                 return False
         return True
 
