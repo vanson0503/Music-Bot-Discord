@@ -96,6 +96,7 @@ class Song:
     """Đại diện một bài nhạc trong hàng đợi."""
 
     def __init__(self, data: dict, requester: discord.Member):
+        self.extractor: str   = data.get("extractor", "") or ""
         self.url: str         = data.get("url") or ""
         self.webpage_url: str = data.get("webpage_url") or self.url
         self.title: str       = data.get("title", "Unknown")
@@ -348,16 +349,27 @@ class MusicPlayer:
                 return
 
             try:
-                # Pipe yt-dlp cho YouTube để tránh HTTP 403 Forbidden
-                # Các nguồn khác (như SoundCloud HLS) ưu tiên stream trực tiếp qua FFmpeg
-                url_to_check = song.webpage_url or song.url or ""
-                if "youtube.com" in url_to_check or "youtu.be" in url_to_check:
+                # Kiểm tra nguồn: YouTube dùng yt-dlp pipe để tránh 403
+                # SoundCloud và các nguồn khác dùng direct stream (HLS/MP3 URL)
+                is_youtube = (
+                    "youtube" in song.extractor
+                    or "youtube.com" in song.webpage_url
+                    or "youtu.be" in song.webpage_url
+                )
+                if is_youtube:
+                    log.info(f"🎵 YouTube pipe: {song.title}")
                     source = await loop.run_in_executor(
                         None, lambda: self._make_pipe_source(song)
                     )
                 else:
-                    source = discord.FFmpegPCMAudio(song.url, **FFMPEG_OPTIONS, executable=FFMPEG_EXE)
-                
+                    # SoundCloud / direct URL → FFmpeg stream trực tiếp
+                    log.info(f"🎵 Direct stream ({song.extractor or 'unknown'}): {song.title} → {song.url[:60]}")
+                    source = discord.FFmpegPCMAudio(
+                        song.url,
+                        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                        options="-vn",
+                        executable=FFMPEG_EXE,
+                    )
                 source = discord.PCMVolumeTransformer(source, volume=self.volume)
             except Exception as e:
                 log.error(f"Lỗi tạo source cho '{song.title}': {e}")
