@@ -96,8 +96,8 @@ class Song:
     """Đại diện một bài nhạc trong hàng đợi."""
 
     def __init__(self, data: dict, requester: discord.Member):
-        self.url: str         = data["url"]
-        self.webpage_url: str = data.get("webpage_url", data["url"])
+        self.url: str         = data.get("url") or ""
+        self.webpage_url: str = data.get("webpage_url") or self.url
         self.title: str       = data.get("title", "Unknown")
         self.uploader: str    = data.get("uploader", "Unknown")
         self.duration: int    = int(data.get("duration") or 0)
@@ -348,9 +348,16 @@ class MusicPlayer:
                 return
 
             try:
-                source = await loop.run_in_executor(
-                    None, lambda: self._make_pipe_source(song)
-                )
+                # Pipe yt-dlp cho YouTube để tránh HTTP 403 Forbidden
+                # Các nguồn khác (như SoundCloud HLS) ưu tiên stream trực tiếp qua FFmpeg
+                url_to_check = song.webpage_url or song.url or ""
+                if "youtube.com" in url_to_check or "youtu.be" in url_to_check:
+                    source = await loop.run_in_executor(
+                        None, lambda: self._make_pipe_source(song)
+                    )
+                else:
+                    source = discord.FFmpegPCMAudio(song.url, **FFMPEG_OPTIONS, executable=FFMPEG_EXE)
+                
                 source = discord.PCMVolumeTransformer(source, volume=self.volume)
             except Exception as e:
                 log.error(f"Lỗi tạo source cho '{song.title}': {e}")
