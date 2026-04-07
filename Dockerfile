@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 # Cài đặt FFmpeg (Bắt buộc để bot có thể phát nhạc)
 RUN apt-get update && \
-    apt-get install -y ffmpeg curl build-essential && \
+    apt-get install -y ffmpeg curl build-essential libopus0 libsodium23 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
