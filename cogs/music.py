@@ -60,24 +60,59 @@ class Music(commands.Cog):
             await ctx.send(embed=err_embed("Bạn phải vào **Voice Channel** trước!"))
             return False
 
+        target_channel = ctx.author.voice.channel
         vc = ctx.guild.voice_client
+
+        # Nếu voice client đang ở sai kênh → di chuyển
+        if vc and vc.channel == target_channel:
+            return True  # Đã đúng kênh, không cần làm gì thêm
+
+        # Nếu vc tồn tại nhưng bị broken (transport đang đóng) hoặc sai kênh → dọn dẹp trước
         if vc:
-            if vc.channel != ctx.author.voice.channel:
-                try:
-                    await vc.move_to(ctx.author.voice.channel)
-                except asyncio.TimeoutError:
-                    await ctx.send(embed=err_embed("Lỗi Timeout: Không thể di chuyển tới voice channel!"))
-                    return False
-        else:
             try:
-                await ctx.author.voice.channel.connect(timeout=15.0)
-            except discord.ClientException:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+            # Chờ discord.py dọn sạch state
+            await asyncio.sleep(0.5)
+
+        # Thử kết nối (có 1 lần retry nếu thất bại)
+        for attempt in range(2):
+            try:
+                await target_channel.connect(timeout=20.0, reconnect=True)
+                return True
+            except asyncio.TimeoutError:
+                if attempt == 0:
+                    log.warning("Voice connect timeout, thử lại lần 2...")
+                    await asyncio.sleep(1)
+                    continue
+                await ctx.send(embed=err_embed(
+                    "⏱️ Hết thời gian kết nối Voice Channel. Vui lòng thử lại!"
+                ))
+                return False
+            except discord.ClientException as e:
+                log.error(f"ClientException khi connect voice: {e}")
                 await ctx.send(embed=err_embed("Không thể kết nối tới voice channel!"))
                 return False
-            except asyncio.TimeoutError:
-                await ctx.send(embed=err_embed("Lỗi Timeout: Hết thời gian chờ kết nối tới voice channel. Vui lòng thử lại!"))
+            except Exception as e:
+                # Bắt ClientConnectionResetError và các lỗi transport khác
+                log.error(f"Lỗi kết nối voice (attempt {attempt+1}): {type(e).__name__}: {e}")
+                if attempt == 0:
+                    # Thử dọn sạch rồi retry
+                    vc2 = ctx.guild.voice_client
+                    if vc2:
+                        try:
+                            await vc2.disconnect(force=True)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(1)
+                    continue
+                await ctx.send(embed=err_embed(
+                    f"❌ Lỗi kết nối voice channel: `{type(e).__name__}`. Vui lòng thử lại!"
+                ))
                 return False
-        return True
+
+        return False
 
     # ── Lệnh /help ────────────────────────────────────────────────────────────
 
