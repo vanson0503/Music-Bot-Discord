@@ -113,6 +113,7 @@ class Song:
 
     def __init__(self, data: dict, requester: discord.Member):
         self.extractor: str   = data.get("extractor", "") or ""
+        self.protocol: str    = data.get("protocol", "") or ""   # http / https / m3u8 / m3u8_native
         self.url: str         = data.get("url") or ""
         self.webpage_url: str = data.get("webpage_url") or self.url
         self.title: str       = data.get("title", "Unknown")
@@ -392,23 +393,23 @@ class MusicPlayer:
                     )
                 else:
                     url = song.url
-                    # HLS (.m3u8 / playlist) cần protocol_whitelist, KHÔNG dùng -reconnect_streamed
-                    # vì sẽ gây crash FFmpeg (SIGSEGV / return code -11)
+                    # Phân biệt dựa theo `protocol` thực tế từ yt-dlp, KHÔNG dùng extractor
+                    # vì SoundCloud có cả HTTP progressive lẫn HLS tùy bài
+                    hls_protocols = ("m3u8", "m3u8_native", "m3u8_streaming")
                     is_hls = (
-                        "m3u8" in url
+                        song.protocol in hls_protocols
+                        or "m3u8" in url
                         or "/playlist/" in url
                         or "/hls/" in url
-                        or song.extractor in ("soundcloud", "soundcloud:search")
                     )
                     if is_hls:
-                        before_opts = (
-                            "-protocol_whitelist file,http,https,tcp,tls,crypto "
-                            "-reconnect 1 -reconnect_delay_max 5"
-                        )
-                        log.info(f"🎵 HLS stream ({song.extractor}): {song.title} → {url[:60]}")
+                        # HLS: cần protocol_whitelist, KHÔNG dùng -reconnect_streamed
+                        before_opts = "-protocol_whitelist file,http,https,tcp,tls,crypto -reconnect 1 -reconnect_delay_max 5"
+                        log.info(f"🎵 HLS stream [{song.protocol}] ({song.extractor}): {song.title} → {url[:60]}")
                     else:
+                        # Plain HTTP/HTTPS: reconnect đủ để xử lý ngắt kết nối
                         before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-                        log.info(f"🎵 Direct stream ({song.extractor}): {song.title} → {url[:60]}")
+                        log.info(f"🎵 Direct stream [{song.protocol}] ({song.extractor}): {song.title} → {url[:60]}")
 
                     source = discord.FFmpegPCMAudio(
                         url,
