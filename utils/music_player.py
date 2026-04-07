@@ -362,11 +362,28 @@ class MusicPlayer:
                         None, lambda: self._make_pipe_source(song)
                     )
                 else:
-                    # SoundCloud / direct URL → FFmpeg stream trực tiếp
-                    log.info(f"🎵 Direct stream ({song.extractor or 'unknown'}): {song.title} → {song.url[:60]}")
+                    url = song.url
+                    # HLS (.m3u8 / playlist) cần protocol_whitelist, KHÔNG dùng -reconnect_streamed
+                    # vì sẽ gây crash FFmpeg (SIGSEGV / return code -11)
+                    is_hls = (
+                        "m3u8" in url
+                        or "/playlist/" in url
+                        or "/hls/" in url
+                        or song.extractor in ("soundcloud", "soundcloud:search")
+                    )
+                    if is_hls:
+                        before_opts = (
+                            "-protocol_whitelist file,http,https,tcp,tls,crypto "
+                            "-reconnect 1 -reconnect_delay_max 5"
+                        )
+                        log.info(f"🎵 HLS stream ({song.extractor}): {song.title} → {url[:60]}")
+                    else:
+                        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+                        log.info(f"🎵 Direct stream ({song.extractor}): {song.title} → {url[:60]}")
+
                     source = discord.FFmpegPCMAudio(
-                        song.url,
-                        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                        url,
+                        before_options=before_opts,
                         options="-vn",
                         executable=FFMPEG_EXE,
                     )
