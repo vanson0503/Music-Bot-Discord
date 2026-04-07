@@ -72,6 +72,22 @@ YTDL_OPTIONS = {
     **_COOKIE_OPTS,
 }
 
+# ─── YT-DLP Options cho SoundCloud (ưu tiên progressive MP3, tránh HLS) ──────
+# SoundCloud cung cấp 2 loại stream:
+#   1. HLS opus  (cf-hls-opus-media.sndcdn.com) → m3u8 playlist  → FFmpeg crash
+#   2. Progressive MP3 (cf-media.sndcdn.com)   → direct HTTP     → ổn định
+# Format string dưới đây ưu tiên progressive hơn HLS.
+YTDL_OPTIONS_SC = {
+    **YTDL_OPTIONS,
+    "format": (
+        "bestaudio[protocol=https]/"
+        "bestaudio[protocol=http]/"
+        "bestaudio[ext=mp3]/"
+        "bestaudio[ext=opus]/"
+        "bestaudio/best"
+    ),
+}
+
 # ─── FFmpeg pipe options (dùng khi pipe từ yt-dlp process) ──────────────────
 FFMPEG_PIPE_OPTIONS = {
     "pipe": True,
@@ -159,9 +175,16 @@ class QueueEntry:
             url = self.webpage_url or self.data.get("url", "")
             if not url:
                 return None
+
+            # Chọn ytdl options phù hợp với nguồn
+            is_sc = "soundcloud.com" in url
+            opts  = YTDL_OPTIONS_SC if is_sc else YTDL_OPTIONS
+            if is_sc:
+                log.info(f"🎵 Resolve SoundCloud (ưu tiên progressive MP3): {self.title}")
+
             data = await loop.run_in_executor(
                 _YTDL_POOL,
-                lambda: _ytdl_extract(url, YTDL_OPTIONS),
+                lambda: _ytdl_extract(url, opts),
             )
             if not data:
                 return None
@@ -171,6 +194,12 @@ class QueueEntry:
                 data = entries[0] if entries else None
             if not data:
                 return None
+
+            # Log URL sẽ được dùng để detect HLS hay không
+            resolved_url = data.get("url", "")
+            protocol     = data.get("protocol", "")
+            log.info(f"   → URL: {resolved_url[:80]}  |  protocol: {protocol}")
+
             self._song = Song(data, self.requester)
             return self._song
         except Exception as e:
