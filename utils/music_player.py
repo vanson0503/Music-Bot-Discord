@@ -12,8 +12,11 @@ from typing import Optional
 
 import discord
 import yt_dlp
+import imageio_ffmpeg
 
 log = logging.getLogger("MusicPlayer")
+
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ─── ThreadPool riêng cho yt-dlp ─────────────────────────────────────────────
 _YTDL_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdl")
@@ -396,7 +399,9 @@ class MusicPlayer:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        return discord.FFmpegPCMAudio(process.stdout, pipe=True, options="-vn")
+        return discord.FFmpegPCMAudio(
+            process.stdout, pipe=True, executable=FFMPEG_EXE, options="-vn"
+        )
 
     async def _prefetch_next(self, loop: asyncio.AbstractEventLoop):
         """Pre-fetch stream URL của bài tiếp trong queue (chạy nền)."""
