@@ -21,6 +21,13 @@ FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 # ─── ThreadPool riêng cho yt-dlp ─────────────────────────────────────────────
 _YTDL_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdl")
 
+def _get_ytdl_pool() -> ThreadPoolExecutor:
+    """Trả về pool đang hoạt động. Tạo lại nếu đã bị shutdown."""
+    global _YTDL_POOL
+    if getattr(_YTDL_POOL, '_shutdown', False):
+        _YTDL_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdl")
+    return _YTDL_POOL
+
 # ─── Cookie setup ─────────────────────────────────────────────────────────────
 # Thứ tự ưu tiên: cookies.txt file → browser cookies → không dùng cookie
 _COOKIES_FILE = Path(__file__).parent.parent / "cookies.txt"
@@ -184,7 +191,7 @@ class QueueEntry:
                 log.info(f"🎵 Resolve SoundCloud (ưu tiên progressive MP3): {self.title}")
 
             data = await loop.run_in_executor(
-                _YTDL_POOL,
+                _get_ytdl_pool(),
                 lambda: _ytdl_extract(url, opts),
             )
             if not data:
@@ -258,7 +265,7 @@ class MusicPlayer:
 
         try:
             data = await loop.run_in_executor(
-                _YTDL_POOL,
+                _get_ytdl_pool(),
                 lambda: _ytdl_extract(search_query, opts),
             )
         except Exception as e:
@@ -282,7 +289,7 @@ class MusicPlayer:
 
         try:
             data = await loop.run_in_executor(
-                _YTDL_POOL,
+                _get_ytdl_pool(),
                 lambda: _ytdl_extract(f"scsearch{count}:{query}", opts),
             )
         except Exception as e:
@@ -505,7 +512,6 @@ class MusicPlayer:
     def destroy(self):
         self._task.cancel()
         self.clear_queue()
-        _YTDL_POOL.shutdown(wait=False)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
