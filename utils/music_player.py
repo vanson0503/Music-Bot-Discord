@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 import re
-import subprocess
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -29,34 +28,27 @@ def _get_ytdl_pool() -> ThreadPoolExecutor:
     return _YTDL_POOL
 
 # ─── Cookie setup ─────────────────────────────────────────────────────────────
-# Thứ tự ưu tiên: cookies.txt file → browser cookies → không dùng cookie
 _COOKIES_FILE = Path(__file__).parent.parent / "cookies.txt"
-_BROWSER_ORDER = ["chrome", "edge", "firefox", "chromium", "brave"]
 
 def _get_cookie_opts() -> dict:
-    """Tự động phát hiện cookie phù hợp nhất."""
-    # 1. File cookies.txt (ưu tiên cao nhất, ổn định nhất)
     if _COOKIES_FILE.exists():
         log.info(f"🍪 Dùng cookies.txt: {_COOKIES_FILE}")
         return {"cookiefile": str(_COOKIES_FILE)}
-    # 2. Browser được chỉ định trong .env
     browser_env = os.getenv("COOKIE_BROWSER", "").lower().strip()
     if browser_env:
         log.info(f"🍪 Dùng cookies từ browser: {browser_env}")
         return {"cookiesfrombrowser": (browser_env,)}
-    # Không dùng cookies nếu không cần — tránh conflict PO Token
-    log.info("ℹ️  Không dùng cookies (player_client sẽ xử lý auth)")
     return {}
 
 _COOKIE_OPTS = _get_cookie_opts()
 
-# ─── YT-DLP Options (tối ưu tốc độ) ─────────────────────────────────────────
+# ─── YT-DLP Options (YouTube only) ───────────────────────────────────────────
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "default_search": "scsearch",
+    "default_search": "ytsearch",   # Tìm kiếm trên YouTube
     "source_address": "0.0.0.0",
     "skip_download": True,
     "writethumbnail": False,
@@ -65,10 +57,8 @@ YTDL_OPTIONS = {
     "writedescription": False,
     "writeannotations": False,
     "ignoreerrors": True,
-    "socket_timeout": 10,
+    "socket_timeout": 15,
     "retries": 3,
-    # Dùng Node.js để giải mã chữ ký YouTube (bắt buộc cho nhiều video)
-    "js_runtimes": {"node": {}},
     "extractor_args": {
         "youtube": {
             "skip": ["translated_subs"],
@@ -79,29 +69,7 @@ YTDL_OPTIONS = {
     **_COOKIE_OPTS,
 }
 
-# ─── YT-DLP Options cho SoundCloud (ưu tiên progressive MP3, tránh HLS) ──────
-# SoundCloud cung cấp 2 loại stream:
-#   1. HLS opus  (cf-hls-opus-media.sndcdn.com) → m3u8 playlist  → FFmpeg crash
-#   2. Progressive MP3 (cf-media.sndcdn.com)   → direct HTTP     → ổn định
-# Format string dưới đây ưu tiên progressive hơn HLS.
-YTDL_OPTIONS_SC = {
-    **YTDL_OPTIONS,
-    "format": (
-        "bestaudio[protocol=https]/"
-        "bestaudio[protocol=http]/"
-        "bestaudio[ext=mp3]/"
-        "bestaudio[ext=opus]/"
-        "bestaudio/best"
-    ),
-}
-
-# ─── FFmpeg pipe options (dùng khi pipe từ yt-dlp process) ──────────────────
-FFMPEG_PIPE_OPTIONS = {
-    "pipe": True,
-    "options": "-vn",
-}
-
-# ─── FFmpeg URL options (fallback) ───────────────────────────────────────────
+# ─── FFmpeg options cho stream trực tiếp ─────────────────────────────────────
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
@@ -109,7 +77,7 @@ FFMPEG_OPTIONS = {
 
 URL_REGEX = re.compile(
     r"^(https?://)?(www\.)?"
-    r"(youtube\.com|youtu\.be|music\.youtube\.com|soundcloud\.com)"
+    r"(youtube\.com|youtu\.be|music\.youtube\.com)"
 )
 
 
@@ -120,7 +88,6 @@ class Song:
 
     def __init__(self, data: dict, requester: discord.Member):
         self.extractor: str   = data.get("extractor", "") or ""
-        self.protocol: str    = data.get("protocol", "") or ""   # http / https / m3u8 / m3u8_native
         self.url: str         = data.get("url") or ""
         self.webpage_url: str = data.get("webpage_url") or self.url
         self.title: str       = data.get("title", "Unknown")
@@ -141,26 +108,26 @@ class Song:
         embed = discord.Embed(
             title=title,
             description=f"[{self.title}]({self.webpage_url})",
-            color=0x1DB954,
+            color=0xFF0000,
         )
         embed.set_thumbnail(url=self.thumbnail)
-        embed.add_field(name="⏱️ Thời lượng", value=self.duration_str,    inline=True)
-        embed.add_field(name="🎤 Kênh",        value=self.uploader,        inline=True)
-        embed.add_field(name="👤 Yêu cầu bởi", value=self.requester.mention, inline=True)
+        embed.add_field(name="⏱️ Thời lượng", value=self.duration_str,       inline=True)
+        embed.add_field(name="🎤 Kênh",        value=self.uploader,           inline=True)
+        embed.add_field(name="👤 Yêu cầu bởi", value=self.requester.mention,  inline=True)
         return embed
 
 
-# ─── QueueEntry (metadata trước khi resolve stream URL) ──────────────────────
+# ─── QueueEntry ───────────────────────────────────────────────────────────────
 
 class QueueEntry:
     """
-    Lưu trữ thông tin bài nhạc TRƯỚC khi resolve stream URL.
+    Lưu metadata bài nhạc TRƯỚC khi resolve stream URL.
     Stream URL YouTube hết hạn sau ~6h nên chỉ resolve ngay trước khi phát.
     """
     def __init__(self, data: dict, requester: discord.Member):
-        self.data       = data          # Raw yt-dlp data (có thể là partial)
-        self.requester  = requester
-        self._song: Optional[Song] = None   # Cached sau khi resolve
+        self.data      = data
+        self.requester = requester
+        self._song: Optional[Song] = None
 
     @property
     def title(self) -> str:
@@ -175,43 +142,32 @@ class QueueEntry:
         return self.data.get("webpage_url", "")
 
     async def resolve(self, loop: asyncio.AbstractEventLoop) -> Optional[Song]:
-        """Resolve stream URL thực sự, trả về Song sẵn sàng để phát."""
+        """Resolve stream URL thực sự, trả về Song sẵn sàng phát."""
         if self._song:
             return self._song
         try:
-            # Re-extract để lấy stream URL mới nhất (tránh URL expired)
             url = self.webpage_url or self.data.get("url", "")
             if not url:
                 return None
 
-            # Chọn ytdl options phù hợp với nguồn
-            is_sc = "soundcloud.com" in url
-            opts  = YTDL_OPTIONS_SC if is_sc else YTDL_OPTIONS
-            if is_sc:
-                log.info(f"🎵 Resolve SoundCloud (ưu tiên progressive MP3): {self.title}")
-
+            log.info(f"🔄 Resolving YouTube stream: {self.title}")
             data = await loop.run_in_executor(
                 _get_ytdl_pool(),
-                lambda: _ytdl_extract(url, opts),
+                lambda: _ytdl_extract(url, YTDL_OPTIONS),
             )
             if not data:
                 return None
-            # Lấy entry đầu nếu là playlist
             if "entries" in data:
                 entries = [e for e in data["entries"] if e]
                 data = entries[0] if entries else None
             if not data:
                 return None
 
-            # Log URL sẽ được dùng để detect HLS hay không
-            resolved_url = data.get("url", "")
-            protocol     = data.get("protocol", "")
-            log.info(f"   → URL: {resolved_url[:80]}  |  protocol: {protocol}")
-
+            log.info(f"   → URL: {data.get('url','')[:80]}")
             self._song = Song(data, self.requester)
             return self._song
         except Exception as e:
-            log.error(f"Lỗi resolve stream URL cho '{self.title}': {e}")
+            log.error(f"Lỗi resolve stream '{self.title}': {e}")
             return None
 
 
@@ -226,10 +182,10 @@ class MusicPlayer:
         self.channel      = ctx.channel
         self.idle_timeout = idle_timeout
 
-        self._queue: deque[QueueEntry]     = deque()
-        self.current: Optional[Song]       = None
-        self._prefetched: Optional[Song]   = None   # Bài đã pre-fetch sẵn
-        self.volume: float                 = 0.5
+        self._queue: deque[QueueEntry]   = deque()
+        self.current: Optional[Song]     = None
+        self._prefetched: Optional[Song] = None
+        self.volume: float               = 0.5
         self._next  = asyncio.Event()
         self._task  = asyncio.ensure_future(self._player_loop())
 
@@ -249,19 +205,18 @@ class MusicPlayer:
         vc = self.guild.voice_client
         return bool(vc and vc.is_paused())
 
-    # ── Tìm kiếm ─────────────────────────────────────────────────────────────
+    # ── Tìm kiếm (YouTube) ───────────────────────────────────────────────────
 
     @staticmethod
     async def search(query: str, *, loop: asyncio.AbstractEventLoop = None) -> Optional[dict]:
-        """Tìm kiếm và trả về metadata dict (KHÔNG có stream URL để nhanh hơn)."""
+        """Tìm kiếm YouTube và trả về metadata (không có stream URL)."""
         loop = loop or asyncio.get_event_loop()
         is_url = bool(URL_REGEX.match(query))
-        search_query = query if is_url else f"scsearch:{query}"
+        search_query = query if is_url else f"ytsearch:{query}"
 
-        # Khi search: dùng flat_extract để cực nhanh (chỉ lấy metadata, không URL)
         opts = dict(YTDL_OPTIONS)
         if not is_url:
-            opts["extract_flat"] = "in_playlist"   # Chỉ lấy metadata nhẹ
+            opts["extract_flat"] = "in_playlist"
 
         try:
             data = await loop.run_in_executor(
@@ -281,16 +236,16 @@ class MusicPlayer:
 
     @staticmethod
     async def search_many(query: str, count: int = 5, *, loop: asyncio.AbstractEventLoop = None) -> list[dict]:
-        """Tìm nhiều kết quả (flat, nhanh)."""
+        """Tìm nhiều kết quả YouTube (flat, nhanh)."""
         loop = loop or asyncio.get_event_loop()
         opts = dict(YTDL_OPTIONS)
         opts["extract_flat"] = "in_playlist"
-        opts["noplaylist"] = False
+        opts["noplaylist"]   = False
 
         try:
             data = await loop.run_in_executor(
                 _get_ytdl_pool(),
-                lambda: _ytdl_extract(f"scsearch{count}:{query}", opts),
+                lambda: _ytdl_extract(f"ytsearch{count}:{query}", opts),
             )
         except Exception as e:
             log.error(f"Lỗi search_many: {e}")
@@ -312,7 +267,7 @@ class MusicPlayer:
         self._prefetched = None
 
     def skip(self):
-        self._prefetched = None   # Huỷ pre-fetch khi skip
+        self._prefetched = None
         vc = self.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
@@ -346,7 +301,7 @@ class MusicPlayer:
         while True:
             self._next.clear()
 
-            # ── Chờ có bài hoặc timeout idle ─────────────────────────────────
+            # Chờ có bài hoặc timeout idle
             if not self._queue and not self._prefetched:
                 try:
                     await asyncio.wait_for(self._wait_for_song(), timeout=self.idle_timeout)
@@ -354,15 +309,14 @@ class MusicPlayer:
                     await self._idle_disconnect()
                     return
 
-            # ── Lấy song: dùng pre-fetch nếu có ─────────────────────────────
+            # Lấy song: dùng pre-fetch nếu có
             if self._prefetched:
                 song = self._prefetched
                 self._prefetched = None
                 log.info(f"▶ Phát từ pre-fetch: {song.title}")
             else:
                 entry = self._queue.popleft()
-                log.info(f"🔄 Resolve stream: {entry.title}")
-                song = await entry.resolve(loop)
+                song  = await entry.resolve(loop)
 
             if not song:
                 await self.channel.send(
@@ -375,49 +329,25 @@ class MusicPlayer:
 
             self.current = song
 
-            # ── Pre-fetch bài tiếp theo trong background ──────────────────────
+            # Pre-fetch bài tiếp trong background
             if self._queue:
                 asyncio.ensure_future(self._prefetch_next(loop))
 
-            # ── Tạo FFmpeg source qua pipe (stable hơn URL trực tiếp) ────────
+            # Kiểm tra voice client
             vc = self.guild.voice_client
             if not vc:
                 self.current = None
                 return
 
+            # Tạo FFmpeg source từ stream URL trực tiếp
             try:
-                # YouTube và SoundCloud → dùng yt-dlp pipe (stable nhất)
-                # Nguồn khác → dùng direct FFmpeg stream
-                is_youtube = (
-                    "youtube" in song.extractor
-                    or "youtube.com" in song.webpage_url
-                    or "youtu.be" in song.webpage_url
+                log.info(f"🎵 Playing (YouTube): {song.title}")
+                source = discord.FFmpegPCMAudio(
+                    song.url,
+                    before_options=FFMPEG_OPTIONS["before_options"],
+                    options=FFMPEG_OPTIONS["options"],
+                    executable=FFMPEG_EXE,
                 )
-                is_soundcloud = "soundcloud" in song.extractor
-
-                if is_youtube or is_soundcloud:
-                    log.info(f"🎵 Pipe ({song.extractor}): {song.title}")
-                    source = await loop.run_in_executor(
-                        None, lambda: self._make_pipe_source(song)
-                    )
-                else:
-                    url = song.url
-                    hls_protocols = ("m3u8", "m3u8_native", "m3u8_streaming")
-                    is_hls = (
-                        song.protocol in hls_protocols
-                        or "m3u8" in url
-                        or "/playlist/" in url
-                        or "/hls/" in url
-                    )
-                    if is_hls:
-                        before_opts = "-protocol_whitelist file,http,https,tcp,tls,crypto -reconnect 1 -reconnect_delay_max 5"
-                        log.info(f"🎵 HLS [{song.protocol}] ({song.extractor}): {song.title} → {url[:60]}")
-                    else:
-                        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-                        log.info(f"🎵 Direct [{song.protocol}] ({song.extractor}): {song.title} → {url[:60]}")
-                    source = discord.FFmpegPCMAudio(
-                        url, before_options=before_opts, options="-vn", executable=FFMPEG_EXE,
-                    )
                 source = discord.PCMVolumeTransformer(source, volume=self.volume)
             except Exception as e:
                 log.error(f"Lỗi tạo source cho '{song.title}': {e}")
@@ -441,55 +371,17 @@ class MusicPlayer:
             await self._next.wait()
             self.current = None
 
-    @staticmethod
-    def _make_pipe_source(song: Song) -> discord.FFmpegPCMAudio:
-        """
-        Dùng yt-dlp subprocess pipe audio trực tiếp vào FFmpeg.
-        - YouTube: dùng bestaudio để tránh HTTP 403
-        - SoundCloud: ưu tiên progressive MP3/HTTPS để tránh HLS m3u8 crash
-        """
-        is_sc = "soundcloud.com" in (song.webpage_url or "")
-        fmt = (
-            # Progressive HTTPS/HTTP trước, HLS là lựa chọn cuối cùng
-            "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio[ext=mp3]/bestaudio/best"
-            if is_sc
-            else "bestaudio/best"
-        )
-        ytdl_cmd = [
-            "yt-dlp",
-            "--format", fmt,
-            "--quiet",
-            "--no-warnings",
-            "--output", "-",       # output ra stdout
-            song.webpage_url,
-        ]
-        # Thêm cookies nếu có
-        cookies_file = Path(__file__).parent.parent / "cookies.txt"
-        if cookies_file.exists():
-            ytdl_cmd += ["--cookies", str(cookies_file)]
-
-        log.info(f"📥 yt-dlp pipe [fmt={fmt[:40]}]: {song.webpage_url[:60]}")
-        process = subprocess.Popen(
-            ytdl_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        return discord.FFmpegPCMAudio(
-            process.stdout, pipe=True, executable=FFMPEG_EXE, options="-vn"
-        )
-
     async def _prefetch_next(self, loop: asyncio.AbstractEventLoop):
-        """Pre-fetch stream URL của bài tiếp trong queue (chạy nền)."""
+        """Pre-fetch stream URL bài tiếp trong queue (chạy nền)."""
         if not self._queue:
             return
-        next_entry = self._queue[0]   # Peek, không pop
+        next_entry = self._queue[0]
         log.info(f"🔁 Pre-fetching: {next_entry.title}")
         try:
             song = await next_entry.resolve(loop)
             if song and self._queue and self._queue[0] is next_entry:
-                # Chỉ cache nếu bài này vẫn còn ở đầu queue
                 self._prefetched = song
-                self._queue.popleft()   # Đã pre-fetch → remove khỏi queue
+                self._queue.popleft()
                 log.info(f"✅ Pre-fetch xong: {song.title}")
         except Exception as e:
             log.warning(f"Pre-fetch thất bại (sẽ resolve khi phát): {e}")
