@@ -70,8 +70,20 @@ YTDL_OPTIONS = {
 }
 
 # ─── FFmpeg options cho stream trực tiếp ─────────────────────────────────────
+# YouTube googlevideo.com yêu cầu Referer + User-Agent header,
+# không có → FFmpeg crash với return code -11 (SIGSEGV)
+_YT_HEADERS = (
+    "Referer: https://www.youtube.com/\r\n"
+    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36\r\n"
+)
+
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "before_options": (
+        f"-headers '{_YT_HEADERS}'"
+        " -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    ),
     "options": "-vn",
 }
 
