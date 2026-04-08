@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 import re
-import subprocess
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -43,7 +42,7 @@ def _get_cookie_opts() -> dict:
 
 _COOKIE_OPTS = _get_cookie_opts()
 
-# ─── YT-DLP Options (metadata only — không cần stream URL) ───────────────────
+# ─── YT-DLP Options (Chỉ YouTube, tối ưu lấy URL) ────────────────────────────
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -69,6 +68,17 @@ YTDL_OPTIONS = {
     "postprocessors": [],
     **_COOKIE_OPTS,
 }
+
+# ─── FFmpeg Options (Dùng flags riêng lẻ thay vì -headers để tránh crash -11) ──
+# Dùng -user_agent và -referer thay vì -headers vì Windows/CMD shell hay lỗi quote
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+REFERER = "https://www.youtube.com/"
+
+FFMPEG_OPTIONS = (
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+    f'-user_agent "{USER_AGENT}" '
+    f'-referer "{REFERER}"'
+)
 
 URL_REGEX = re.compile(
     r"^(https?://)?(www\.)?"
@@ -106,20 +116,20 @@ class Song:
             color=0xFF0000,
         )
         embed.set_thumbnail(url=self.thumbnail)
-        embed.add_field(name="⏱️ Thời lượng", value=self.duration_str,      inline=True)
-        embed.add_field(name="🎤 Kênh",        value=self.uploader,          inline=True)
-        embed.add_field(name="👤 Yêu cầu bởi", value=self.requester.mention, inline=True)
+        embed.add_field(name="⏱️ Thời lượng", value=self.duration_str,       inline=True)
+        embed.add_field(name="🎤 Kênh",        value=self.uploader,           inline=True)
+        embed.add_field(name="👤 Yêu cầu bởi", value=self.requester.mention,  inline=True)
         return embed
 
 
 # ─── QueueEntry ───────────────────────────────────────────────────────────────
 
 class QueueEntry:
-    """Lưu metadata bài nhạc. webpage_url dùng để pipe qua yt-dlp khi phát."""
-
+    """Lưu metadata bài nhạc. Stream URL sẽ được resolve ngay trước khi phát."""
     def __init__(self, data: dict, requester: discord.Member):
         self.data      = data
         self.requester = requester
+        self._song: Optional[Song] = None
 
     @property
     def title(self) -> str:
@@ -133,8 +143,32 @@ class QueueEntry:
     def webpage_url(self) -> str:
         return self.data.get("webpage_url", "") or self.data.get("url", "")
 
-    def to_song(self) -> Song:
-        return Song(self.data, self.requester)
+    async def resolve(self, loop: asyncio.AbstractEventLoop) -> Optional[Song]:
+        """Lấy stream URL mới nhất."""
+        if self._song:
+            return self._song
+        try:
+            url = self.webpage_url
+            if not url:
+                return None
+
+            log.info(f"🔄 Resolving YouTube: {self.title}")
+            data = await loop.run_in_executor(
+                _get_ytdl_pool(),
+                lambda: _ytdl_extract(url, YTDL_OPTIONS),
+            )
+            if not data:
+                return None
+            if "entries" in data:
+                data = data["entries"][0] if data["entries"] else None
+            if not data:
+                return None
+
+            self._song = Song(data, self.requester)
+            return self._song
+        except Exception as e:
+            log.error(f"Lỗi resolve '{self.title}': {e}")
+            return None
 
 
 # ─── MusicPlayer ─────────────────────────────────────────────────────────────
@@ -148,13 +182,11 @@ class MusicPlayer:
         self.channel      = ctx.channel
         self.idle_timeout = idle_timeout
 
-        self._queue: deque[QueueEntry] = deque()
-        self.current: Optional[Song]   = None
-        self.volume: float             = 0.5
+        self._queue: deque[QueueEntry]   = deque()
+        self.current: Optional[Song]     = None
+        self.volume: float               = 0.5
         self._next  = asyncio.Event()
         self._task  = asyncio.ensure_future(self._player_loop())
-
-    # ── Properties ───────────────────────────────────────────────────────────
 
     @property
     def queue(self) -> list[QueueEntry]:
@@ -170,59 +202,36 @@ class MusicPlayer:
         vc = self.guild.voice_client
         return bool(vc and vc.is_paused())
 
-    # ── Tìm kiếm (YouTube) ───────────────────────────────────────────────────
-
     @staticmethod
     async def search(query: str, *, loop: asyncio.AbstractEventLoop = None) -> Optional[dict]:
-        """Tìm kiếm YouTube và trả về metadata."""
         loop = loop or asyncio.get_event_loop()
         is_url = bool(URL_REGEX.match(query))
         search_query = query if is_url else f"ytsearch:{query}"
-
         opts = dict(YTDL_OPTIONS)
-        if not is_url:
-            opts["extract_flat"] = "in_playlist"
+        if not is_url: opts["extract_flat"] = "in_playlist"
 
         try:
-            data = await loop.run_in_executor(
-                _get_ytdl_pool(),
-                lambda: _ytdl_extract(search_query, opts),
-            )
+            data = await loop.run_in_executor(_get_ytdl_pool(), lambda: _ytdl_extract(search_query, opts))
+            if not data: return None
+            if "entries" in data: return data["entries"][0] if data["entries"] else None
+            return data
         except Exception as e:
             log.error(f"Lỗi search: {e}")
             return None
 
-        if not data:
-            return None
-        if "entries" in data:
-            entries = [e for e in data["entries"] if e]
-            return entries[0] if entries else None
-        return data
-
     @staticmethod
     async def search_many(query: str, count: int = 5, *, loop: asyncio.AbstractEventLoop = None) -> list[dict]:
-        """Tìm nhiều kết quả YouTube."""
         loop = loop or asyncio.get_event_loop()
         opts = dict(YTDL_OPTIONS)
         opts["extract_flat"] = "in_playlist"
-        opts["noplaylist"]   = False
-
+        opts["noplaylist"] = False
         try:
-            data = await loop.run_in_executor(
-                _get_ytdl_pool(),
-                lambda: _ytdl_extract(f"ytsearch{count}:{query}", opts),
-            )
+            data = await loop.run_in_executor(_get_ytdl_pool(), lambda: _ytdl_extract(f"ytsearch{count}:{query}", opts))
+            if not data: return []
+            return [e for e in data.get("entries", []) if e][:count] if "entries" in data else [data]
         except Exception as e:
             log.error(f"Lỗi search_many: {e}")
             return []
-
-        if not data:
-            return []
-        if "entries" in data:
-            return [e for e in data["entries"] if e][:count]
-        return [data]
-
-    # ── Hàng đợi ─────────────────────────────────────────────────────────────
 
     def enqueue(self, entry: QueueEntry):
         self._queue.append(entry)
@@ -232,8 +241,7 @@ class MusicPlayer:
 
     def skip(self):
         vc = self.guild.voice_client
-        if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
+        if vc and (vc.is_playing() or vc.is_paused()): vc.stop()
 
     def pause(self):
         vc = self.guild.voice_client
@@ -252,10 +260,7 @@ class MusicPlayer:
     def set_volume(self, vol: float):
         self.volume = max(0.0, min(1.0, vol))
         vc = self.guild.voice_client
-        if vc and vc.source:
-            vc.source.volume = self.volume
-
-    # ── Vòng lặp phát nhạc ───────────────────────────────────────────────────
+        if vc and vc.source: vc.source.volume = self.volume
 
     async def _player_loop(self):
         await self.ctx.bot.wait_until_ready()
@@ -263,8 +268,6 @@ class MusicPlayer:
 
         while True:
             self._next.clear()
-
-            # Chờ có bài hoặc timeout idle
             if not self._queue:
                 try:
                     await asyncio.wait_for(self._wait_for_song(), timeout=self.idle_timeout)
@@ -273,101 +276,53 @@ class MusicPlayer:
                     return
 
             entry = self._queue.popleft()
-            song  = entry.to_song()
-            self.current = song
-
-            vc = self.guild.voice_client
-            if not vc:
-                self.current = None
-                return
-
-            # ── Tạo source bằng yt-dlp pipe ──────────────────────────────────
-            try:
-                log.info(f"🎵 Pipe YouTube: {song.title} → {song.webpage_url[:60]}")
-                source = await loop.run_in_executor(
-                    None,
-                    lambda s=song: _make_ytdlp_pipe_source(s),
-                )
-                source = discord.PCMVolumeTransformer(source, volume=self.volume)
-            except Exception as e:
-                log.error(f"Lỗi tạo source '{song.title}': {e}")
-                await self.channel.send(
-                    embed=discord.Embed(
-                        description=f"❌ Lỗi phát **{song.title}**. Bỏ qua...",
-                        color=0xFF4444,
-                    )
-                )
-                self.current = None
+            song  = await entry.resolve(loop)
+            
+            if not song:
+                await self.channel.send(embed=discord.Embed(description="❌ Lỗi resolve bài này. Bỏ qua...", color=0xFF4444))
                 continue
 
-            def _after(err):
-                if err:
-                    log.error(f"FFmpeg lỗi '{song.title}': {err}")
-                self._next.set()
+            self.current = song
+            vc = self.guild.voice_client
+            if not vc: return
 
-            vc.play(source, after=_after)
-            await self.channel.send(embed=song.create_embed("🎵 Đang phát"))
+            try:
+                log.info(f"🎵 URL play: {song.title}")
+                source = discord.FFmpegPCMAudio(
+                    song.url,
+                    before_options=FFMPEG_OPTIONS,
+                    options="-vn",
+                    executable=FFMPEG_EXE
+                )
+                source = discord.PCMVolumeTransformer(source, volume=self.volume)
+                
+                def _after(err):
+                    if err: log.error(f"FFmpeg lỗi: {err}")
+                    self._next.set()
 
-            await self._next.wait()
+                vc.play(source, after=_after)
+                await self.channel.send(embed=song.create_embed("🎵 Đang phát"))
+                await self._next.wait()
+            except Exception as e:
+                log.error(f"Lỗi play '{song.title}': {e}")
+                await self.channel.send(embed=discord.Embed(description=f"❌ Lỗi phát **{song.title}**.", color=0xFF4444))
+            
             self.current = None
 
     async def _wait_for_song(self):
-        while not self._queue:
-            await asyncio.sleep(0.5)
+        while not self._queue: await asyncio.sleep(0.5)
 
     async def _idle_disconnect(self):
         vc = self.guild.voice_client
-        if vc:
-            await vc.disconnect()
-        await self.channel.send(
-            embed=discord.Embed(
-                description="⏹️ Hết nhạc và không có ai yêu cầu, bot đã rời kênh.",
-                color=0x888888,
-            )
-        )
+        if vc: await vc.disconnect()
+        await self.channel.send(embed=discord.Embed(description="⏹️ Đã rời kênh vì không có nhạc.", color=0x888888))
 
     def destroy(self):
         self._task.cancel()
         self.clear_queue()
-
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _ytdl_extract(query: str, opts: dict) -> Optional[dict]:
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(query, download=False)
-
-
-def _make_ytdlp_pipe_source(song: Song) -> discord.FFmpegPCMAudio:
-    """
-    Dùng yt-dlp subprocess pipe audio → FFmpeg.
-    Cách này yt-dlp tự xử lý hoàn toàn auth của YouTube,
-    FFmpeg chỉ đọc từ stdin nên không bao giờ bị crash -11.
-    """
-    cmd = [
-        "yt-dlp",
-        "--format", "bestaudio/best",
-        "--quiet",
-        "--no-warnings",
-        "--output", "-",          # pipe audio ra stdout
-        song.webpage_url,
-    ]
-
-    # Thêm cookies nếu có
-    if _COOKIES_FILE.exists():
-        cmd += ["--cookies", str(_COOKIES_FILE)]
-
-    log.info(f"📥 yt-dlp pipe: {song.webpage_url[:70]}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-    )
-
-    return discord.FFmpegPCMAudio(
-        proc.stdout,
-        pipe=True,
-        executable=FFMPEG_EXE,
-        options="-vn",
-    )
