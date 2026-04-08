@@ -379,22 +379,22 @@ class MusicPlayer:
                 return
 
             try:
-                # Kiểm tra nguồn: YouTube dùng yt-dlp pipe để tránh 403
-                # SoundCloud và các nguồn khác dùng direct stream (HLS/MP3 URL)
+                # YouTube và SoundCloud → dùng yt-dlp pipe (stable nhất)
+                # Nguồn khác → dùng direct FFmpeg stream
                 is_youtube = (
                     "youtube" in song.extractor
                     or "youtube.com" in song.webpage_url
                     or "youtu.be" in song.webpage_url
                 )
-                if is_youtube:
-                    log.info(f"🎵 YouTube pipe: {song.title}")
+                is_soundcloud = "soundcloud" in song.extractor
+
+                if is_youtube or is_soundcloud:
+                    log.info(f"🎵 Pipe ({song.extractor}): {song.title}")
                     source = await loop.run_in_executor(
                         None, lambda: self._make_pipe_source(song)
                     )
                 else:
                     url = song.url
-                    # Phân biệt dựa theo `protocol` thực tế từ yt-dlp, KHÔNG dùng extractor
-                    # vì SoundCloud có cả HTTP progressive lẫn HLS tùy bài
                     hls_protocols = ("m3u8", "m3u8_native", "m3u8_streaming")
                     is_hls = (
                         song.protocol in hls_protocols
@@ -403,19 +403,13 @@ class MusicPlayer:
                         or "/hls/" in url
                     )
                     if is_hls:
-                        # HLS: cần protocol_whitelist, KHÔNG dùng -reconnect_streamed
                         before_opts = "-protocol_whitelist file,http,https,tcp,tls,crypto -reconnect 1 -reconnect_delay_max 5"
-                        log.info(f"🎵 HLS stream [{song.protocol}] ({song.extractor}): {song.title} → {url[:60]}")
+                        log.info(f"🎵 HLS [{song.protocol}] ({song.extractor}): {song.title} → {url[:60]}")
                     else:
-                        # Plain HTTP/HTTPS: reconnect đủ để xử lý ngắt kết nối
                         before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-                        log.info(f"🎵 Direct stream [{song.protocol}] ({song.extractor}): {song.title} → {url[:60]}")
-
+                        log.info(f"🎵 Direct [{song.protocol}] ({song.extractor}): {song.title} → {url[:60]}")
                     source = discord.FFmpegPCMAudio(
-                        url,
-                        before_options=before_opts,
-                        options="-vn",
-                        executable=FFMPEG_EXE,
+                        url, before_options=before_opts, options="-vn", executable=FFMPEG_EXE,
                     )
                 source = discord.PCMVolumeTransformer(source, volume=self.volume)
             except Exception as e:
@@ -444,11 +438,19 @@ class MusicPlayer:
     def _make_pipe_source(song: Song) -> discord.FFmpegPCMAudio:
         """
         Dùng yt-dlp subprocess pipe audio trực tiếp vào FFmpeg.
-        Tránh hoàn toàn vấn đề URL expiry và HTTP 403 khi stream.
+        - YouTube: dùng bestaudio để tránh HTTP 403
+        - SoundCloud: ưu tiên progressive MP3/HTTPS để tránh HLS m3u8 crash
         """
+        is_sc = "soundcloud.com" in (song.webpage_url or "")
+        fmt = (
+            # Progressive HTTPS/HTTP trước, HLS là lựa chọn cuối cùng
+            "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio[ext=mp3]/bestaudio/best"
+            if is_sc
+            else "bestaudio/best"
+        )
         ytdl_cmd = [
             "yt-dlp",
-            "--format", "bestaudio/best",
+            "--format", fmt,
             "--quiet",
             "--no-warnings",
             "--output", "-",       # output ra stdout
@@ -459,7 +461,7 @@ class MusicPlayer:
         if cookies_file.exists():
             ytdl_cmd += ["--cookies", str(cookies_file)]
 
-        log.info(f"🎵 Pipe: {' '.join(ytdl_cmd[-3:])}")
+        log.info(f"📥 yt-dlp pipe [fmt={fmt[:40]}]: {song.webpage_url[:60]}")
         process = subprocess.Popen(
             ytdl_cmd,
             stdout=subprocess.PIPE,
